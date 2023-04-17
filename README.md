@@ -8,7 +8,6 @@
 - [Data Access Monitor backport](https://github.com/EndCredits/android_kernel_xiaomi_sm8350/tree/feat-damon)
 - [ZRAM backport](https://github.com/EndCredits/android_kernel_xiaomi_sm8350/tree/feat-zram)
 - [Support standalone install by Anykernel3](https://github.com/EndCredits/android_kernel_xiaomi_sm8350/tree/feat-ak3)
-- [Kernel SU](https://github.com/EndCredits/android_kernel_xiaomi_sm8350/tree/feat-ksu)
 - [Lazy RCU](https://github.com/EndCredits/android_kernel_xiaomi_sm8350/tree/feat-rculazy)
 
 ## Feats planning to be added

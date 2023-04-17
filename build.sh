@@ -189,10 +189,6 @@ use_prebuilt_dlkm(){
     cp $DLKM_BUILD_PATH/$TARGET_VENDOR_DLKM $TARGET_OUT
 }
 
-ksu_prepare(){
-    ./scripts/config --file $TARGET_OUT/.config -e CONFIG_KSU
-}
-
 main(){
     if [ $1 == "help" -o $1 == "-h" ]
     then
@@ -241,15 +237,6 @@ main(){
     elif [ $1 == "upgkidefconf" ]
     then
         update_gki_defconfig
-    elif [ $1 == "buildksu" ]
-    then
-        make_defconfig
-        ksu_prepare
-        build_kernel
-        link_all_dtb_files
-        use_prebuilt_dlkm
-        generate_flashable
-        git checkout HEAD .
     elif [ $1 == "build_dlkm" ]
     then
         use_prebuilt_dlkm
