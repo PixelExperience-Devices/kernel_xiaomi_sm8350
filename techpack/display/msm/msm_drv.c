@@ -39,6 +39,7 @@
 
 #include <linux/of_address.h>
 #include <linux/kthread.h>
+#include <linux/workqueue.h>
 #include <uapi/linux/sched/types.h>
 #include <drm/drm_of.h>
 #include <drm/drm_auth.h>
@@ -50,6 +51,7 @@
 #include "msm_mmu.h"
 #include "sde_wb.h"
 #include "sde_dbg.h"
+#include "sde/sde_encoder.h"
 
 /*
  * MSM driver version:
@@ -67,6 +69,9 @@
 #define MSM_VERSION_PATCHLEVEL	0
 
 #define LASTCLOSE_TIMEOUT_MS	500
+
+#define IDLE_ENCODER_MASK_DEFAULT	2
+#define IDLE_TIMEOUT_MS_DEFAULT		100 - IDLE_POWERCOLLAPSE_DURATION
 
 #define msm_wait_event_timeout(waitq, cond, timeout_ms, ret)		\
 	do {								\
@@ -98,6 +103,24 @@ static void msm_fb_output_poll_changed(struct drm_device *dev)
 
 	if (priv->fbdev)
 		drm_fb_helper_hotplug_event(priv->fbdev);
+}
+
+static void msm_drm_display_thread_priority_worker(struct kthread_work *work)
+{
+	int ret = 0;
+	struct sched_param param = { 0 };
+	struct task_struct *task = current->group_leader;
+
+	/**
+	 * this priority was found during empiric testing to have appropriate
+	 * realtime scheduling to process display updates and interact with
+	 * other real time and normal priority task
+	 */
+	param.sched_priority = 16;
+	ret = sched_setscheduler(task, SCHED_FIFO, &param);
+	if (ret)
+		pr_warn("pid:%d name:%s priority update failed: %d\n",
+			current->tgid, task->comm, ret);
 }
 
 /**
@@ -543,7 +566,7 @@ static int msm_init_vram(struct drm_device *dev)
 		ret = of_property_read_u32(dev->dev->of_node,
 					"qcom,vram-size", &vram_size);
 		size = (ret < 0) ? memparse(vram, NULL) : vram_size;
-		DRM_INFO("using 0x%x VRAM carveout\n", size);
+		DRM_INFO("using 0x%lx VRAM carveout\n", size);
 		ret = 0;
 	}
 
@@ -598,20 +621,13 @@ static int msm_component_bind_all(struct device *dev,
 }
 #endif
 
-static int msm_drm_display_thread_create(struct sched_param param,
-	struct msm_drm_private *priv, struct drm_device *ddev,
+static int msm_drm_display_thread_create(struct msm_drm_private *priv, struct drm_device *ddev,
 	struct device *dev)
 {
 	int i, ret = 0;
 
-	/**
-	 * this priority was found during empiric testing to have appropriate
-	 * realtime scheduling to process display updates and interact with
-	 * other real time and normal priority task
-	 */
-	param.sched_priority = 16;
+	kthread_init_work(&priv->thread_priority_work, msm_drm_display_thread_priority_worker);
 	for (i = 0; i < priv->num_crtcs; i++) {
-
 		/* initialize display thread */
 		priv->disp_thread[i].crtc_id = priv->crtcs[i]->base.id;
 		kthread_init_worker(&priv->disp_thread[i].worker);
@@ -620,11 +636,7 @@ static int msm_drm_display_thread_create(struct sched_param param,
 			kthread_run(kthread_worker_fn,
 				&priv->disp_thread[i].worker,
 				"crtc_commit:%d", priv->disp_thread[i].crtc_id);
-		ret = sched_setscheduler(priv->disp_thread[i].thread,
-							SCHED_FIFO, &param);
-		if (ret)
-			pr_warn("display thread priority update failed: %d\n",
-									ret);
+		kthread_queue_work(&priv->disp_thread[i].worker, &priv->thread_priority_work);
 
 		if (IS_ERR(priv->disp_thread[i].thread)) {
 			dev_err(dev, "failed to create crtc_commit kthread\n");
@@ -646,11 +658,7 @@ static int msm_drm_display_thread_create(struct sched_param param,
 		 * frame_pending counters beyond 2. This can lead to commit
 		 * failure at crtc commit level.
 		 */
-		ret = sched_setscheduler(priv->event_thread[i].thread,
-							SCHED_FIFO, &param);
-		if (ret)
-			pr_warn("display event thread priority update failed: %d\n",
-									ret);
+		kthread_queue_work(&priv->event_thread[i].worker, &priv->thread_priority_work);
 
 		if (IS_ERR(priv->event_thread[i].thread)) {
 			dev_err(dev, "failed to create crtc_event kthread\n");
@@ -685,12 +693,7 @@ static int msm_drm_display_thread_create(struct sched_param param,
 	kthread_init_worker(&priv->pp_event_worker);
 	priv->pp_event_thread = kthread_run(kthread_worker_fn,
 			&priv->pp_event_worker, "pp_event");
-
-	ret = sched_setscheduler(priv->pp_event_thread,
-						SCHED_FIFO, &param);
-	if (ret)
-		pr_warn("pp_event thread priority update failed: %d\n",
-								ret);
+	kthread_queue_work(&priv->pp_event_worker, &priv->thread_priority_work);
 
 	if (IS_ERR(priv->pp_event_thread)) {
 		dev_err(dev, "failed to create pp_event kthread\n");
@@ -700,8 +703,8 @@ static int msm_drm_display_thread_create(struct sched_param param,
 	}
 
 	return 0;
-
 }
+
 static struct msm_kms *_msm_drm_component_init_helper(
 		struct msm_drm_private *priv,
 		struct drm_device *ddev, struct device *dev,
@@ -755,6 +758,161 @@ static struct msm_kms *_msm_drm_component_init_helper(
 	return kms;
 }
 
+static ssize_t idle_encoder_mask_store(struct device *device,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct drm_device *ddev = dev_get_drvdata(device);
+	struct msm_drm_private *priv = ddev->dev_private;
+	struct msm_idle *idle = &priv->idle;
+	u32 encoder_mask = 0;
+	int rc;
+	unsigned long flags;
+
+	rc = kstrtouint(buf, 0, &encoder_mask);
+	if (rc)
+		return rc;
+
+	spin_lock_irqsave(&idle->lock, flags);
+	idle->encoder_mask = encoder_mask;
+	idle->active_mask &= encoder_mask;
+	spin_unlock_irqrestore(&idle->lock, flags);
+
+	return count;
+}
+
+static ssize_t idle_encoder_mask_show(struct device *device,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	struct drm_device *ddev = dev_get_drvdata(device);
+	struct msm_drm_private *priv = ddev->dev_private;
+	struct msm_idle *idle = &priv->idle;
+
+	return snprintf(buf, PAGE_SIZE, "0x%x\n", idle->encoder_mask);
+}
+
+static ssize_t idle_timeout_ms_store(struct device *device,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct drm_device *ddev = dev_get_drvdata(device);
+	struct msm_drm_private *priv = ddev->dev_private;
+	struct msm_idle *idle = &priv->idle;
+	u32 timeout_ms = 0;
+	int rc;
+	unsigned long flags;
+
+	rc = kstrtouint(buf, 10, &timeout_ms);
+	if (rc)
+		return rc;
+
+	spin_lock_irqsave(&idle->lock, flags);
+	idle->timeout_ms = timeout_ms;
+	spin_unlock_irqrestore(&idle->lock, flags);
+
+	return count;
+}
+
+static ssize_t idle_timeout_ms_show(struct device *device,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	struct drm_device *ddev = dev_get_drvdata(device);
+	struct msm_drm_private *priv = ddev->dev_private;
+	struct msm_idle *idle = &priv->idle;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", idle->timeout_ms);
+}
+
+static ssize_t idle_state_show(struct device *device,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	struct drm_device *ddev = dev_get_drvdata(device);
+	struct msm_drm_private *priv = ddev->dev_private;
+	struct msm_idle *idle = &priv->idle;
+	const char *state;
+	unsigned long flags;
+
+	spin_lock_irqsave(&idle->lock, flags);
+	if (idle->active_mask) {
+		state = "active";
+		spin_unlock_irqrestore(&idle->lock, flags);
+		return scnprintf(buf, PAGE_SIZE, "%s (0x%x)\n",
+				 state, idle->active_mask);
+	} else if (delayed_work_pending(&idle->work))
+		state = "pending";
+	else
+		state = "idle";
+	spin_unlock_irqrestore(&idle->lock, flags);
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n", state);
+}
+
+static DEVICE_ATTR_RW(idle_encoder_mask);
+static DEVICE_ATTR_RW(idle_timeout_ms);
+static DEVICE_ATTR_RO(idle_state);
+
+static const struct attribute *msm_idle_attrs[] = {
+	&dev_attr_idle_encoder_mask.attr,
+	&dev_attr_idle_timeout_ms.attr,
+	&dev_attr_idle_state.attr,
+	NULL
+};
+
+static void msm_idle_work(struct work_struct *work)
+{
+	struct delayed_work *dw = to_delayed_work(work);
+	struct msm_idle *idle = container_of(dw, struct msm_idle, work);
+	struct msm_drm_private *priv = container_of(idle,
+					struct msm_drm_private, idle);
+
+	if (!idle->active_mask)
+		sysfs_notify(&priv->dev->dev->kobj, NULL, "idle_state");
+}
+
+void msm_idle_set_state(struct drm_encoder *encoder, bool active)
+{
+	struct drm_device *ddev = encoder->dev;
+	struct msm_drm_private *priv = ddev->dev_private;
+	struct msm_idle *idle = &priv->idle;
+	unsigned int mask = 1 << drm_encoder_index(encoder);
+	unsigned long flags;
+
+	spin_lock_irqsave(&idle->lock, flags);
+
+	if (mask & idle->encoder_mask) {
+		if (active)
+			idle->active_mask |= mask;
+		else
+			idle->active_mask &= ~mask;
+
+		if (idle->timeout_ms && !idle->active_mask)
+			mod_delayed_work(system_wq, &idle->work,
+					 msecs_to_jiffies(idle->timeout_ms));
+		else
+			cancel_delayed_work(&idle->work);
+	}
+	spin_unlock_irqrestore(&idle->lock, flags);
+}
+
+static void msm_idle_init(struct drm_device *ddev)
+{
+	struct msm_drm_private *priv = ddev->dev_private;
+	struct msm_idle *idle = &priv->idle;
+
+	if (sysfs_create_files(&ddev->dev->kobj, msm_idle_attrs) < 0)
+		pr_warn("failed to create idle state file");
+
+	idle->active_mask = 0;
+	idle->encoder_mask = IDLE_ENCODER_MASK_DEFAULT;
+	idle->timeout_ms = IDLE_TIMEOUT_MS_DEFAULT;
+
+	INIT_DELAYED_WORK(&idle->work, msm_idle_work);
+	spin_lock_init(&idle->lock);
+}
+
 static int msm_drm_device_init(struct platform_device *pdev,
 		struct drm_driver *drv)
 {
@@ -793,6 +951,8 @@ static int msm_drm_device_init(struct platform_device *pdev,
 		goto dbg_init_fail;
 	}
 
+	msm_idle_init(ddev);
+
 	pm_runtime_enable(dev);
 
 	ret = pm_runtime_get_sync(dev);
@@ -826,7 +986,6 @@ static int msm_drm_component_init(struct device *dev)
 	struct msm_drm_private *priv = ddev->dev_private;
 	struct msm_kms *kms = NULL;
 	int ret;
-	struct sched_param param = { 0 };
 	struct drm_crtc *crtc;
 
 	ret = msm_mdss_init(ddev);
@@ -864,7 +1023,7 @@ static int msm_drm_component_init(struct device *dev)
 	sde_rotator_register();
 	sde_rotator_smmu_driver_register();
 
-	ret = msm_drm_display_thread_create(param, priv, ddev, dev);
+	ret = msm_drm_display_thread_create(priv, ddev, dev);
 	if (ret) {
 		dev_err(dev, "msm_drm_display_thread_create failed\n");
 		goto fail;
@@ -2136,7 +2295,7 @@ static int msm_drm_component_dependency_check(struct device *dev)
 			struct platform_device *pdev =
 					of_find_device_by_node(node);
 			if (!platform_get_drvdata(pdev)) {
-				dev_err(dev,
+				dev_dbg(dev,
 					"qcom,sde_rscc not probed yet\n");
 				return -EPROBE_DEFER;
 			} else {
@@ -2221,6 +2380,7 @@ static struct platform_driver msm_platform_driver = {
 		.of_match_table = dt_match,
 		.pm     = &msm_pm_ops,
 		.suppress_bind_attrs = true,
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 };
 

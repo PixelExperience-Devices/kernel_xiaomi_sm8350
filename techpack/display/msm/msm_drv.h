@@ -177,6 +177,9 @@ enum msm_mdp_crtc_property {
 	CRTC_PROP_CACHE_STATE,
 	CRTC_PROP_VM_REQ_STATE,
 
+#ifdef CONFIG_DRM_SDE_EXPO
+	CRTC_PROP_DIM_LAYER_EXPO,
+#endif
 	/* total # of properties */
 	CRTC_PROP_COUNT
 };
@@ -256,11 +259,11 @@ enum msm_display_spr_pack_type {
 };
 
 static const char *msm_spr_pack_type_str[MSM_DISPLAY_SPR_TYPE_MAX] = {
-	[MSM_DISPLAY_SPR_TYPE_NONE] = "",
-	[MSM_DISPLAY_SPR_TYPE_PENTILE] = "pentile",
-	[MSM_DISPLAY_SPR_TYPE_RGBW] = "rgbw",
-	[MSM_DISPLAY_SPR_TYPE_YYGM] = "yygm",
-	[MSM_DISPLAY_SPR_TYPE_YYGW] = "yygw"
+	[MSM_DISPLAY_SPR_TYPE_NONE] =  "",
+	[MSM_DISPLAY_SPR_TYPE_PENTILE] =  "pentile",
+	[MSM_DISPLAY_SPR_TYPE_RGBW] =  "rgbw",
+	[MSM_DISPLAY_SPR_TYPE_YYGM] =  "yygm",
+	[MSM_DISPLAY_SPR_TYPE_YYGW] =  "yygw",
 };
 
 /**
@@ -826,6 +829,15 @@ struct msm_drm_thread {
 	struct kthread_worker worker;
 };
 
+struct msm_idle {
+	u32 timeout_ms;
+	u32 encoder_mask;
+	u32 active_mask;
+
+	spinlock_t lock;
+	struct delayed_work work;
+};
+
 struct msm_drm_private {
 
 	struct drm_device *dev;
@@ -886,6 +898,8 @@ struct msm_drm_private {
 	struct task_struct *pp_event_thread;
 	struct kthread_worker pp_event_worker;
 
+	struct kthread_work thread_priority_work;
+
 	unsigned int num_encoders;
 	struct drm_encoder *encoders[MAX_ENCODERS];
 
@@ -939,6 +953,8 @@ struct msm_drm_private {
 
 	struct mutex vm_client_lock;
 	struct list_head vm_client_list;
+
+	struct msm_idle idle;
 };
 
 /* get struct msm_kms * from drm_device * */
@@ -1214,6 +1230,7 @@ static inline void __exit msm_mdp_unregister(void)
 }
 #endif /* CONFIG_DRM_MSM_MDP5 */
 
+void msm_idle_set_state(struct drm_encoder *encoder, bool active);
 #ifdef CONFIG_DEBUG_FS
 void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m);
 void msm_gem_describe_objects(struct list_head *list, struct seq_file *m);

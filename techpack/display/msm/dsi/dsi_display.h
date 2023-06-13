@@ -204,8 +204,6 @@ struct dsi_display {
 	struct drm_device *drm_dev;
 	struct drm_connector *drm_conn;
 	struct drm_connector *ext_conn;
-	struct class *class;
-	struct device *dev;
 
 	const char *name;
 	const char *display_type;
@@ -837,5 +835,7 @@ int dsi_display_ctrl_vreg_on(struct dsi_display *display);
  * Return: Zero on Success
  */
 int dsi_display_ctrl_vreg_off(struct dsi_display *display);
+
+struct dsi_display *get_main_display(void);
 
 #endif /* _DSI_DISPLAY_H_ */

@@ -53,6 +53,11 @@ enum dsi_backlight_type {
 	DSI_BACKLIGHT_MAX,
 };
 
+enum dsi_doze_mode_type {
+	DSI_DOZE_LPM = 0,
+	DSI_DOZE_HBM,
+};
+
 enum bl_update_flag {
 	BL_UPDATE_DELAY_UNTIL_FIRST_FRAME,
 	BL_UPDATE_NONE,
@@ -121,6 +126,7 @@ struct dsi_backlight_config {
 	u32 bl_min_level;
 	u32 bl_max_level;
 	u32 brightness_max_level;
+	u32 brightness_init_level;
 	u32 bl_level;
 	u32 bl_scale;
 	u32 bl_scale_sv;
@@ -205,12 +211,6 @@ struct dsi_panel_ops {
 	int (*parse_power_cfg)(struct dsi_panel *panel);
 };
 
-enum dsi_doze_mode_type {
-	DSI_DOZE_MODE_NOLP,
-	DSI_DOZE_MODE_LP_LBM,
-	DSI_DOZE_MODE_LP_HBM,
-};
-
 struct dsi_panel {
 	const char *name;
 	const char *type;
@@ -277,14 +277,20 @@ struct dsi_panel {
 
 	struct dsi_panel_ops panel_ops;
 
-	enum dsi_doze_mode_type doze_mode_active;
-	enum dsi_doze_mode_type doze_mode_requested;
-	bool aod_nolp_command_enabled;
+	bool doze_enabled;
+	bool doze_requested;
+	enum dsi_doze_mode_type doze_mode;
 
 	bool fod_hbm_enabled;
 	bool fod_hbm_requested;
 	bool fod_ui;
 	int local_hbm_on_1000nit_51_index;
+
+	bool hbm_enabled;
+
+#ifdef CONFIG_DRM_SDE_EXPO
+	bool dimlayer_exposure;
+#endif
 };
 
 static inline bool dsi_panel_ulps_feature_enabled(struct dsi_panel *panel)
@@ -427,4 +433,9 @@ int dsi_panel_apply_requested_fod_hbm(struct dsi_panel *panel);
 void dsi_panel_set_fod_ui(struct dsi_panel *panel, bool status);
 void dsi_panel_request_fod_hbm(struct dsi_panel *panel, bool status);
 
+int dsi_panel_set_doze_status(struct dsi_panel *panel, bool status);
+int dsi_panel_set_doze_mode(struct dsi_panel *panel, enum dsi_doze_mode_type mode);
+
+int dsi_panel_set_hbm_mode(struct dsi_panel *panel, bool status);
+int dsi_backlight_update_dpms(struct dsi_backlight_config *bl, int power_state);
 #endif /* _DSI_PANEL_H_ */

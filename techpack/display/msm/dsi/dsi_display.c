@@ -26,6 +26,10 @@
 #include "dsi_parser.h"
 #include "mi_dsi_display.h"
 
+#ifdef CONFIG_DRM_SDE_EXPO
+#include "sde_expo_dim_layer.h"
+#endif
+
 #define to_dsi_display(x) container_of(x, struct dsi_display, host)
 #define INT_BASE_10 10
 
@@ -64,6 +68,8 @@ bool is_skip_op_required(struct dsi_display *display)
 
 	return (display->is_cont_splash_enabled || display->trusted_vm_env);
 }
+
+struct dsi_display *main_display;
 
 static void dsi_display_mask_ctrl_error_interrupts(struct dsi_display *display,
 			u32 mask, bool enable)
@@ -248,6 +254,14 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 		       dsi_display->name, rc);
 		goto error;
 	}
+
+#ifdef CONFIG_DRM_SDE_EXPO
+	if(panel->dimlayer_exposure) {
+		if (bl_lvl && !panel->doze_enabled && !panel->hbm_enabled) {
+			bl_temp = expo_map_dim_level((u32)bl_temp, dsi_display);
+		}
+	}
+#endif
 
 	rc = dsi_panel_set_backlight(panel, (u32)bl_temp);
 	if (rc)
@@ -4317,7 +4331,9 @@ static int dsi_display_res_init(struct dsi_display *display)
 		ctrl->ctrl = dsi_ctrl_get(ctrl->ctrl_of_node);
 		if (IS_ERR_OR_NULL(ctrl->ctrl)) {
 			rc = PTR_ERR(ctrl->ctrl);
-			DSI_ERR("failed to get dsi controller, rc=%d\n", rc);
+			if (rc != -EPROBE_DEFER)
+				DSI_ERR("failed to get dsi controller, rc=%d\n", rc);
+
 			ctrl->ctrl = NULL;
 			goto error_ctrl_put;
 		}
@@ -5403,8 +5419,10 @@ static int _dsi_display_dev_init(struct dsi_display *display)
 
 	rc = dsi_display_res_init(display);
 	if (rc) {
-		DSI_ERR("[%s] failed to initialize resources, rc=%d\n",
-		       display->name, rc);
+		if (rc != -EPROBE_DEFER)
+			DSI_ERR("[%s] failed to initialize resources, rc=%d\n",
+			       display->name, rc);
+
 		goto error;
 	}
 error:
@@ -5663,79 +5681,269 @@ static int dsi_display_pre_acquire(void *data)
 	return 0;
 }
 
-int dsi_display_get_fps(struct dsi_display *display, u32 *fps)
+static ssize_t sysfs_doze_status_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
 {
-	struct dsi_display_mode *cur_mode = NULL;
-	int ret = 0;
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
 
-	if (!display || !display->panel) {
-		DSI_ERR("Invalid display/panel ptr\n");
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
 		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	status = panel->doze_enabled;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", status);
+}
+
+static ssize_t sysfs_doze_status_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
+	int rc = 0;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtobool(buf, &status);
+	if (rc) {
+		pr_err("%s: kstrtobool failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	dsi_panel_set_doze_status(panel, status);
+	mutex_unlock(&panel->panel_lock);
+
+	return count;
+}
+
+static ssize_t sysfs_doze_mode_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	enum dsi_doze_mode_type doze_mode;
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	doze_mode = panel->doze_mode;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", doze_mode);
+}
+
+static ssize_t sysfs_doze_mode_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	int rc = 0;
+	int mode;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtoint(buf, 10, &mode);
+	if (rc) {
+		pr_err("%s: kstrtoint failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	if (mode < DSI_DOZE_LPM || mode > DSI_DOZE_HBM) {
+		pr_err("%s: invalid value for doze mode\n", __func__);
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	dsi_panel_set_doze_mode(panel, (enum dsi_doze_mode_type) mode);
+	mutex_unlock(&panel->panel_lock);
+
+	return count;
+}
+
+#ifdef CONFIG_DRM_SDE_EXPO
+static ssize_t sysfs_dimlayer_exposure_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	status = panel->dimlayer_exposure;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", status);
+}
+
+static ssize_t sysfs_dimlayer_exposure_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	struct drm_connector *connector = NULL;
+	bool status;
+	int rc = 0;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtobool(buf, &status);
+	if (rc) {
+		pr_err("%s: kstrtobool failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	panel = display->panel;
+
+	panel->dimlayer_exposure = status;
+	dsi_display_set_backlight(connector, display, panel->bl_config.bl_level);
+
+	return count;
+}
+#endif
+
+static ssize_t sysfs_hbm_enabled_read(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct dsi_display *display = dev_get_drvdata(dev);
+	if (!display->panel)
+		return 0;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", display->panel->hbm_enabled);
+}
+
+static ssize_t sysfs_hbm_enabled_write(struct device *dev,
+	    struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display = dev_get_drvdata(dev);
+	int rc = 0;
+	bool status;
+
+	if (!display->panel)
+		return -EINVAL;
+
+	rc = kstrtobool(buf, &status);
+	if (rc) {
+		pr_err("%s: kstrtobool failed. rc=%d\n", __func__, rc);
+		return rc;
 	}
 
 	mutex_lock(&display->display_lock);
-	cur_mode = display->panel->cur_mode;
-	if (cur_mode) {
-		*fps =  cur_mode->timing.refresh_rate;
-	} else {
-		ret = -EINVAL;
-	}
-	mutex_unlock(&display->display_lock);
 
-	return ret;
-}
+	display->panel->hbm_enabled = status;
+	if (!dsi_panel_initialized(display->panel))
+		goto error;
 
-static ssize_t dynamic_fps_show(struct device *dev, struct device_attribute *attr,
-				 char *buf)
-{
-	struct dsi_display *display;
-	u32 fps = 0;
-	int rc = 0;
-
-	struct platform_device *pdev = to_platform_device(dev);
-	display = platform_get_drvdata(pdev);
-
-	if (!display) {
-		DSI_ERR("Invalid display\n");
-		return -EINVAL;
-	}
-
-	rc = dsi_display_get_fps(display, &fps);
+	rc = dsi_display_clk_ctrl(display->dsi_clk_handle,
+			DSI_CORE_CLK, DSI_CLK_ON);
 	if (rc) {
-		DSI_ERR("%s: failed to get fps. rc=%d\n", __func__, rc);
-		return snprintf(buf, PAGE_SIZE, "%s\n", "null");
+		pr_err("[%s] failed to enable DSI core clocks, rc=%d\n",
+		       display->name, rc);
+		goto error;
 	}
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", fps);
-}
-static DEVICE_ATTR_RO(dynamic_fps);
+	rc = dsi_panel_set_hbm_mode(display->panel, display->panel->hbm_enabled);
+	if (rc) {
+		pr_err("unable to set hbm mode\n");
+		goto error;
+	}
 
-static struct attribute *mi_display_attrs[] = {
-	&dev_attr_dynamic_fps.attr,
+	rc = dsi_display_clk_ctrl(display->dsi_clk_handle,
+			DSI_CORE_CLK, DSI_CLK_OFF);
+	if (rc) {
+		pr_err("[%s] failed to disable DSI core clocks, rc=%d\n",
+		       display->name, rc);
+		goto error;
+	}
+error:
+	mutex_unlock(&display->display_lock);
+	return rc == 0 ? count : rc;
+}
+
+static DEVICE_ATTR(doze_status, 0644,
+			sysfs_doze_status_read,
+			sysfs_doze_status_write);
+
+static DEVICE_ATTR(doze_mode, 0644,
+			sysfs_doze_mode_read,
+			sysfs_doze_mode_write);
+
+#ifdef CONFIG_DRM_SDE_EXPO
+static DEVICE_ATTR(dimlayer_exposure, 0644,
+			sysfs_dimlayer_exposure_read,
+			sysfs_dimlayer_exposure_write);
+#endif
+
+static DEVICE_ATTR(hbm_enabled, 0644,
+			sysfs_hbm_enabled_read,
+			sysfs_hbm_enabled_write);
+
+static struct attribute *display_fs_attrs[] = {
+	&dev_attr_doze_status.attr,
+	&dev_attr_doze_mode.attr,
+#ifdef CONFIG_DRM_SDE_EXPO
+	&dev_attr_dimlayer_exposure.attr,
+#endif
+	&dev_attr_hbm_enabled.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(mi_display);
+static struct attribute_group display_fs_attrs_group = {
+	.attrs = display_fs_attrs,
+};
 
-void dsi_mi_display_init(struct dsi_display *display) {
-	int disp_id = mi_get_disp_id(display);
+static int dsi_display_sysfs_init(struct dsi_display *display)
+{
+	int rc = 0;
+	struct device *dev = &display->pdev->dev;
 
-	if (IS_ERR_OR_NULL(display->class)) {
-		display->class = class_create(THIS_MODULE, "mi_display");
-		if (IS_ERR(display->class))
-			DSI_ERR("class_create failed, rc: %d\n", PTR_ERR(display->class));
-	}
+	rc = sysfs_create_group(&dev->kobj, &display_fs_attrs_group);
+	if (rc)
+		pr_err("failed to create display device attributes");
 
-	if (IS_ERR_OR_NULL(display->dev)) {
-		display->dev = device_create_with_groups(display->class, &display->pdev->dev,
-				0, display, mi_display_groups, "disp-DSI-%d", disp_id);
-		if (IS_ERR(display->dev))
-			DSI_ERR("device_create_with_groups failed for disp-DSI-%d, ret: %d\n", disp_id, PTR_ERR(display->dev));
-	}
+	return rc;
 }
-
-void dsi_mi_display_deinit(struct dsi_display *display) {
-	device_unregister(display->dev);
-	class_destroy(display->class);
+static int dsi_display_sysfs_deinit(struct dsi_display *display)
+{
+	return 0;
 }
 
 /**
@@ -5813,6 +6021,12 @@ static int dsi_display_bind(struct device *dev,
 
 	atomic_set(&display->clkrate_change_pending, 0);
 	display->cached_clk_rate = 0;
+
+	rc = dsi_display_sysfs_init(display);
+	if (rc) {
+		DSI_ERR("[%s] sysfs init failed, rc=%d\n", display->name, rc);
+		goto error;
+	}
 
 	memset(&info, 0x0, sizeof(info));
 
@@ -5947,8 +6161,6 @@ static int dsi_display_bind(struct device *dev,
 
 	msm_register_vm_event(master, dev, &vm_event_ops, (void *)display);
 
-	dsi_mi_display_init(display);
-
 	goto error;
 
 error_host_deinit:
@@ -5965,6 +6177,7 @@ error_ctrl_deinit:
 		dsi_ctrl_put(display_ctrl->ctrl);
 		dsi_phy_put(display_ctrl->phy);
 	}
+	(void)dsi_display_sysfs_deinit(display);
 	(void)dsi_display_debugfs_deinit(display);
 error:
 	mutex_unlock(&display->display_lock);
@@ -6020,9 +6233,8 @@ static void dsi_display_unbind(struct device *dev,
 	}
 
 	atomic_set(&display->clkrate_change_pending, 0);
+	(void)dsi_display_sysfs_deinit(display);
 	(void)dsi_display_debugfs_deinit(display);
-
-	dsi_mi_display_deinit(display);
 
 	mutex_unlock(&display->display_lock);
 }
@@ -6051,7 +6263,9 @@ static int dsi_display_init(struct dsi_display *display)
 
 	rc = _dsi_display_dev_init(display);
 	if (rc) {
-		DSI_ERR("device init failed, rc=%d\n", rc);
+		if (rc != -EPROBE_DEFER)
+			DSI_ERR("device init failed, rc=%d\n", rc);
+
 		goto end;
 	}
 
@@ -7260,6 +7474,7 @@ int dsi_display_get_modes(struct dsi_display *display,
 exit:
 	*out_modes = display->modes;
 	rc = 0;
+	main_display = display;
 
 error:
 	if (rc)
@@ -7577,8 +7792,6 @@ int dsi_display_set_mode(struct dsi_display *display,
 	int rc = 0;
 	struct dsi_display_mode adj_mode;
 	struct dsi_mode_info timing;
-	struct mi_disp_notifier notify_data;
-	int fps;
 
 	if (!display || !mode || !display->panel) {
 		DSI_ERR("Invalid params\n");
@@ -7621,14 +7834,6 @@ int dsi_display_set_mode(struct dsi_display *display,
 			timing.h_active, timing.v_active, timing.refresh_rate);
 	SDE_EVT32(adj_mode.priv_info->mdp_transfer_time_us,
 			timing.h_active, timing.v_active, timing.refresh_rate);
-
-	if (display->panel->cur_mode->timing.refresh_rate != timing.refresh_rate) {
-		fps = timing.refresh_rate;
-		notify_data.data = &fps;
-		notify_data.disp_id = mi_get_disp_id(display);
-		mi_disp_notifier_call_chain(MI_DISP_FPS_CHANGE_EVENT, &notify_data);
-		sysfs_notify(&display->dev->kobj, NULL, "dynamic_fps");
-	}
 
 	memcpy(display->panel->cur_mode, &adj_mode, sizeof(adj_mode));
 error:
@@ -8891,6 +9096,10 @@ int dsi_display_unprepare(struct dsi_display *display)
 
 	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
 	return rc;
+}
+
+struct dsi_display *get_main_display(void) {
+	return main_display;
 }
 
 void __init dsi_display_register(void)
